@@ -1742,7 +1742,7 @@ class BlueprintEditor {
     ════════════════════════════════════════════════════ */
     _save() {
         const data = {
-            version: 2,
+            version: 3,
             nodes: Object.values(this.nodes).map(nd => ({
                 id:        nd.id,
                 x:         nd.x,
@@ -1761,6 +1761,14 @@ class BlueprintEditor {
             connections: Object.values(this.connections).map(cn => ({
                 id: cn.id, fromId: cn.fromId, toId: cn.toId,
                 label: cn.label || '', style: cn.style || 'solid',
+            })),
+            // 分组数据：Set 转 Array 以便 JSON 序列化
+            groups: Object.values(this.groups).map(g => ({
+                id:      g.id,
+                label:   g.label,
+                color:   g.color,          // { bg, border, label }
+                nodeIds: [...g.nodeIds],    // Set → Array
+                x: g.x, y: g.y, w: g.w, h: g.h,
             })),
             pan:         { x: this.panX, y: this.panY },
             zoom:        this.zoom,
@@ -1783,7 +1791,10 @@ class BlueprintEditor {
     _loadFromData(data) {
         // ── 1. 清空当前画布（静默，不记历史）──
         Object.keys(this.nodes).forEach(id => this.nodes[id].el.remove());
+        // 清除所有分组 DOM
+        Object.values(this.groups).forEach(g => g.el?.remove());
         this.nodes = {};
+        this.groups = {};
         this.svgGroup.innerHTML = '';
         this.connections = {};
         this.undoStack = [];
@@ -1832,20 +1843,118 @@ class BlueprintEditor {
             }
         });
 
-        // ── 4. 还原连线（节点渲染后才能计算 pin 位置）──
+        // ── 5. 还原连线 + 分组（节点渲染后执行）──
         setTimeout(() => {
             (data.connections || []).forEach(cn => {
                 this._createConnectionSilent(cn.fromId, cn.toId, cn.id, cn.label || '', cn.style || 'solid');
             });
             this._redrawAllConnections();
+
+            // 还原分组（version >= 3）
+            (data.groups || []).forEach(g => {
+                this._rebuildGroup(g);
+            });
         }, 30);
+    }
+
+    /**
+     * 从已保存的分组数据重建 DOM（不重新计算包围盒，直接使用保存的 x/y/w/h）
+     */
+    _rebuildGroup(g) {
+        const gid         = g.id;
+        const label       = g.label   || '分组';
+        const colorScheme = g.color   || this._groupColors()[0];
+        const nodeIds     = new Set(g.nodeIds || []);
+
+        // 构建分组 DOM（复用同样的结构）
+        const el = document.createElement('div');
+        el.className    = 'group-box';
+        el.dataset.gid  = gid;
+        el.style.cssText = `
+            left:${g.x}px; top:${g.y}px;
+            width:${g.w}px; height:${g.h}px;
+            background:${colorScheme.bg};
+            border-color:${colorScheme.border};
+        `;
+
+        // 标题栏
+        const header = document.createElement('div');
+        header.className   = 'group-header';
+        header.style.color = colorScheme.label;
+        let currentLabel   = label;
+        header.innerHTML   = `
+            <span class="group-label">${this._esc(currentLabel)}</span>
+            <button class="group-delete-btn" title="解散分组">✕</button>
+        `;
+
+        // 双击标题改名
+        const labelSpan = header.querySelector('.group-label');
+        labelSpan.addEventListener('dblclick', ev => {
+            ev.stopPropagation();
+            const input = document.createElement('input');
+            input.value     = currentLabel;
+            input.className = 'group-label-edit';
+            input.style.color = colorScheme.label;
+            header.replaceChild(input, labelSpan);
+            input.focus(); input.select();
+            const finish = () => {
+                currentLabel = input.value.trim() || currentLabel;
+                labelSpan.textContent = currentLabel;
+                this.groups[gid].label = currentLabel;
+                header.replaceChild(labelSpan, input);
+            };
+            input.addEventListener('blur', finish);
+            input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
+        });
+
+        // 删除（解散）分组
+        header.querySelector('.group-delete-btn').addEventListener('click', ev => {
+            ev.stopPropagation();
+            el.remove();
+            delete this.groups[gid];
+        });
+
+        // 拖拽分组（通过标题栏）
+        header.addEventListener('mousedown', ev => {
+            if (ev.button !== 0) return;
+            ev.stopPropagation();
+            const grp = this.groups[gid];
+            const snaps = [...grp.nodeIds]
+                .filter(id => this.nodes[id])
+                .map(id => ({ id, ox: this.nodes[id].x, oy: this.nodes[id].y }));
+            this.draggingGroup = {
+                groupId:     gid,
+                startMouseX: ev.clientX,
+                startMouseY: ev.clientY,
+                startX:      grp.x,
+                startY:      grp.y,
+                memberSnaps: snaps,
+            };
+        });
+
+        el.appendChild(header);
+        // 插到 nodeLayer 最前面（在节点之下）
+        this.nodeLayer.insertBefore(el, this.nodeLayer.firstChild);
+
+        // 写入数据
+        this.groups[gid] = {
+            id: gid,
+            label: currentLabel,
+            color: colorScheme,
+            nodeIds,
+            x: g.x, y: g.y, w: g.w, h: g.h,
+            el,
+        };
     }
 
     _clearAll() {
         Object.keys(this.nodes).forEach(id => {
             this.nodes[id].el.remove();
         });
+        // 清除分组 DOM
+        Object.values(this.groups).forEach(g => g.el?.remove());
         this.nodes       = {};
+        this.groups      = {};
         this.svgGroup.innerHTML = '';
         this.connections = {};
     }
